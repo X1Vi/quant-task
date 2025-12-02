@@ -8,28 +8,52 @@ use tokio::io::AsyncWriteExt;
 use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use serde_json;
 use crate::types::msg::{RecordHeader, MboMsg as C_MboMsg};
 use tokio::task;
+use axum::{extract::State, routing::get, Json, Router};
+use tower_http::cors::CorsLayer;
+
 type BroadcastMsg = Vec<u8>;
 type MessageCache = Arc<Mutex<HashMap<usize, C_MboMsg>>>;
 
 /// Start TCP server and broadcast data to all connected clients
-pub async fn start_server(addr: &str, file_path: String) -> Result<(), Box<dyn std::error::Error>>{
+pub async fn start_server(addr: &str, file_path: String, sleep_time: u64) -> Result<(), Box<dyn std::error::Error>>{
     let listener = TcpListener::bind(addr).await?;
     println!("Server listening on {}", addr);
     
     let (tx, _rx) = broadcast::channel::<BroadcastMsg>(100);
-    
-    // Create bounded cache - max 20 messages
     let cache: MessageCache = Arc::new(Mutex::new(HashMap::with_capacity(20)));
+    
+    // Rate tracking
+    let message_counter = Arc::new(AtomicU64::new(0));
+    
+    // Start rate monitor
+    let counter_clone = message_counter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let count = counter_clone.swap(0, Ordering::Relaxed);
+            println!("📊 Server Rate: {} msg/s", count);
+        }
+    });
+
+    // Start HTTP API server
+    let cache_for_http = cache.clone();
+    tokio::spawn(async move {
+        start_http_server(cache_for_http).await;
+    });
     
     let file_tx = tx.clone();
     let cache_clone = cache.clone();
+    let counter_for_reader = message_counter.clone();
     
     // Spawn task to read DBN file and broadcast messages
     tokio::spawn(async move {
-        if let Err(e) = read_and_broadcast_dbn(file_path, file_tx, cache_clone).await {
+        if let Err(e) = read_and_broadcast_dbn(file_path, file_tx, cache_clone, counter_for_reader, sleep_time).await {
             eprintln!("Error reading DBN file: {}", e);
         }
     });
@@ -48,10 +72,33 @@ pub async fn start_server(addr: &str, file_path: String) -> Result<(), Box<dyn s
     }
 }
 
+async fn start_http_server(cache: MessageCache) {
+    let app = Router::new()
+        .route("/api/messages", get(get_messages))
+        .layer(CorsLayer::permissive())
+        .with_state(cache);
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
+        .await
+        .unwrap();
+    
+    println!("HTTP API listening on http://0.0.0.0:3001");
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_messages(State(cache): State<MessageCache>) -> Json<Vec<C_MboMsg>> {
+    let cache_guard = cache.lock().unwrap();
+    let mut messages: Vec<C_MboMsg> = cache_guard.values().cloned().collect();
+    messages.sort_by_key(|m| m.sequence);
+    Json(messages)
+}
+
 async fn read_and_broadcast_dbn(
     file_path: String,
     tx: broadcast::Sender<BroadcastMsg>,
     cache: MessageCache,
+    counter: Arc<AtomicU64>,
+    sleep_time: u64
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let decoder = Decoder::from_file(file_path)?;
@@ -91,10 +138,11 @@ async fn read_and_broadcast_dbn(
             
             let _ = tx.send(message);
             
-            println!("Broadcasted: {:?}", custom_msg);
+            // Increment counter for rate tracking
+            counter.fetch_add(1, Ordering::Relaxed);
             
-            // Add delay to simulate real-time streaming
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            // Remove println to avoid bottleneck
+            std::thread::sleep(std::time::Duration::from_micros(sleep_time));
         }
         
         Ok(())
@@ -107,7 +155,6 @@ async fn read_and_broadcast_dbn(
     }
 }
 
-// handle_client remains the same
 async fn handle_client(
     mut socket: TcpStream,
     addr: SocketAddr,
