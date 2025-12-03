@@ -10,5 +10,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "0.0.0.0:8080",
         "CLX5_mbo.dbn".to_string(),
         20,
+        50
     ).await
 }

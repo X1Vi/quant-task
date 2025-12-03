@@ -10,8 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::fs::File;
+use std::io::{Write, BufWriter};
 use serde_json;
-use crate::types::msg::{RecordHeader, MboMsg as C_MboMsg, Market};
+use crate::types::msg::{RecordHeader, MboMsg as C_MboMsg, Market, BidAskPair};
 use tokio::task;
 use axum::{extract::State, routing::get, Json, Router};
 use tower_http::cors::CorsLayer;
@@ -19,17 +21,30 @@ use tower_http::cors::CorsLayer;
 type BroadcastMsg = Vec<u8>;
 type MessageCache = Arc<Mutex<HashMap<usize, C_MboMsg>>>;
 
+#[derive(serde::Serialize)]
+struct TimedSnapshot {
+    ts_event: u64,
+    instrument_id: u32,
+    publisher_id: u16,
+    levels: Vec<BidAskPair>,
+}
+
 /// Start TCP server and broadcast data to all connected clients
-pub async fn start_server(addr: &str, file_path: String, sleep_time: u64) -> Result<(), Box<dyn std::error::Error>>{
+pub async fn start_server(
+    addr: &str,
+    file_path: String,
+    sleep_time: u64,
+    snapshot_every_n: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     println!("Server listening on {}", addr);
-    
+
     let (tx, _rx) = broadcast::channel::<BroadcastMsg>(100);
     let cache: MessageCache = Arc::new(Mutex::new(HashMap::with_capacity(20)));
-    
+
     // Rate tracking
     let message_counter = Arc::new(AtomicU64::new(0));
-    
+
     // Start rate monitor
     let counter_clone = message_counter.clone();
     tokio::spawn(async move {
@@ -46,18 +61,27 @@ pub async fn start_server(addr: &str, file_path: String, sleep_time: u64) -> Res
     tokio::spawn(async move {
         start_http_server(cache_for_http).await;
     });
-    
+
     let file_tx = tx.clone();
     let cache_clone = cache.clone();
     let counter_for_reader = message_counter.clone();
-    
+
     // Spawn task to read DBN file and broadcast messages
     tokio::spawn(async move {
-        if let Err(e) = read_and_broadcast_dbn(file_path, file_tx, cache_clone, counter_for_reader, sleep_time).await {
+        if let Err(e) = read_and_broadcast_dbn(
+            file_path,
+            file_tx,
+            cache_clone,
+            counter_for_reader,
+            sleep_time,
+            snapshot_every_n
+        )
+        .await
+        {
             eprintln!("Error reading DBN file: {}", e);
         }
     });
-    
+
     // Accept client connections
     loop {
         match listener.accept().await {
@@ -77,11 +101,11 @@ async fn start_http_server(cache: MessageCache) {
         .route("/api/messages", get(get_messages))
         .layer(CorsLayer::permissive())
         .with_state(cache);
-    
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
         .await
         .unwrap();
-    
+
     println!("HTTP API listening on http://0.0.0.0:3001");
     axum::serve(listener, app).await.unwrap();
 }
@@ -92,73 +116,107 @@ async fn get_messages(State(cache): State<MessageCache>) -> Json<Vec<C_MboMsg>> 
     messages.sort_by_key(|m| m.sequence);
     Json(messages)
 }
+
 async fn read_and_broadcast_dbn(
     file_path: String,
     tx: broadcast::Sender<BroadcastMsg>,
     cache: MessageCache,
     counter: Arc<AtomicU64>,
-    sleep_time: u64
+    sleep_time: u64,
+    snapshot_every_n: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let decoder = Decoder::from_file(file_path)?;
-        let mut stream = decoder.decode_stream::<MboMsg>();
-        let mut index = 0usize;
+    let result = task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let decoder = Decoder::from_file(file_path)?;
+            let mut stream = decoder.decode_stream::<MboMsg>();
+            let mut index = 0usize;
 
-        // --- new: create market and trackers ---
-        let mut market = Market::new();
-        let mut last_inst: Option<u32> = None;
-        let mut last_pub: Option<u16> = None;
+            // --- create market and trackers ---
+            let mut market = Market::new();
+            let mut last_inst: Option<u32> = None;
+            let mut last_pub: Option<u16> = None;
 
-        while let Some(mbo_msg) = stream.next()? {
-            let custom_msg = C_MboMsg {
-                hd: RecordHeader {
-                    rtype: mbo_msg.hd.rtype,
-                    publisher_id: mbo_msg.hd.publisher_id,
-                    instrument_id: mbo_msg.hd.instrument_id,
-                    ts_event: mbo_msg.hd.ts_event,
-                },
-                order_id: mbo_msg.order_id,
-                price: mbo_msg.price,
-                size: mbo_msg.size,
-                flags: mbo_msg.flags.raw(),
-                channel_id: mbo_msg.channel_id,
-                action: mbo_msg.action,
-                side: mbo_msg.side,
-                ts_recv: mbo_msg.ts_recv,
-                ts_in_delta: mbo_msg.ts_in_delta,
-                sequence: mbo_msg.sequence,
-            };
+            // --- open snapshot feed file (JSONL) ---
+            let snapshot_file: File = File::create("snapshots.jsonl")?;
+            let mut snapshot_writer = BufWriter::new(snapshot_file);
 
-            // --- new: update order book + remember ids ---
-            market.apply(&custom_msg);
-            last_inst = Some(custom_msg.instrument_id());
-            last_pub  = Some(custom_msg.publisher_id());
+            while let Some(mbo_msg) = stream.next()? {
+                let custom_msg = C_MboMsg {
+                    hd: RecordHeader {
+                        rtype: mbo_msg.hd.rtype,
+                        publisher_id: mbo_msg.hd.publisher_id,
+                        instrument_id: mbo_msg.hd.instrument_id,
+                        ts_event: mbo_msg.hd.ts_event,
+                    },
+                    order_id: mbo_msg.order_id,
+                    price: mbo_msg.price,
+                    size: mbo_msg.size,
+                    flags: mbo_msg.flags.raw(),
+                    channel_id: mbo_msg.channel_id,
+                    action: mbo_msg.action,
+                    side: mbo_msg.side,
+                    ts_recv: mbo_msg.ts_recv,
+                    ts_in_delta: mbo_msg.ts_in_delta,
+                    sequence: mbo_msg.sequence,
+                };
 
-            {
-                let mut cache_guard = cache.lock().unwrap();
-                cache_guard.insert(index % 20, custom_msg.clone());
+                // --- update order book + remember ids ---
+                market.apply(&custom_msg);
+                last_inst = Some(custom_msg.instrument_id());
+                last_pub = Some(custom_msg.publisher_id());
+
+                // --- periodic book snapshot feed ---
+                if index % snapshot_every_n == 0 {
+                    if let (Some(inst), Some(pub_id)) = (last_inst, last_pub) {
+                        if let Some(books_for_instr) = market.books.get(&inst) {
+                            if let Some(book) = books_for_instr.get(&pub_id) {
+                                // same depth as your single snapshot
+                                let levels: Vec<BidAskPair> = book.get_snapshot(50);
+
+                                let snap = TimedSnapshot {
+                                    ts_event: custom_msg.ts_event(),
+                                    instrument_id: inst,
+                                    publisher_id: pub_id,
+                                    levels,
+                                };
+
+                                serde_json::to_writer(&mut snapshot_writer, &snap)?;
+                                snapshot_writer.write_all(b"\n")?;
+                            }
+                        }
+                    }
+                }
+
+                {
+                    let mut cache_guard = cache.lock().unwrap();
+                    cache_guard.insert(index % 20, custom_msg.clone());
+                }
+
+                index += 1;
+
+                let serialized = serde_json::to_vec(&custom_msg)?;
+                let mut message = serialized;
+                message.push(b'\n');
+
+                let _ = tx.send(message);
+
+                counter.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_micros(sleep_time));
             }
 
-            index += 1;
-
-            let serialized = serde_json::to_vec(&custom_msg)?;
-            let mut message = serialized;
-            message.push(b'\n');
-
-            let _ = tx.send(message);
-
-            counter.fetch_add(1, Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_micros(sleep_time));
-        }
-
-        if let (Some(inst), Some(pub_id)) = (last_inst, last_pub) {
-            if let Err(e) = market.write_snapshot_json(inst, pub_id, 50, "snapshot.json") {
-                eprintln!("Failed to write snapshot.json: {e}");
+            // final single snapshot.json (existing behavior)
+            if let (Some(inst), Some(pub_id)) = (last_inst, last_pub) {
+                if let Err(e) =
+                    market.write_snapshot_json(inst, pub_id, 50, "snapshot.json")
+                {
+                    eprintln!("Failed to write snapshot.json: {e}");
+                }
             }
-        }
 
-        Ok(())
-    }).await;
+            Ok(())
+        },
+    )
+    .await;
 
     match result {
         Ok(Ok(())) => Ok(()),
@@ -167,14 +225,13 @@ async fn read_and_broadcast_dbn(
     }
 }
 
-
 async fn handle_client(
     mut socket: TcpStream,
     addr: SocketAddr,
     mut rx: broadcast::Receiver<BroadcastMsg>,
 ) {
     println!("New client connected: {}", addr);
-    
+
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -193,6 +250,6 @@ async fn handle_client(
             }
         }
     }
-    
+
     println!("Client disconnected: {}", addr);
 }
