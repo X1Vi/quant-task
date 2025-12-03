@@ -24,10 +24,10 @@ cargo run
 
 ## Important Config
 
-Add 20µs sleep in `src/dbn/dbn_local.rs` for better visualization:
+Add 200µs sleep in `src/dbn/dbn_local.rs` for better visualization:
 
 ```rust
-    start_server("127.0.0.1:8080", "CLX5_mbo.dbn".to_string(), 20).await
+    start_server("127.0.0.1:8080", "CLX5_mbo.dbn".to_string(), 200).await
 ```
 
 ## Endpoints
