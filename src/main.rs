@@ -9,8 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dbn::dbn_local::start_server(
         "0.0.0.0:8080",
         "CLX5_mbo.dbn".to_string(),
-        20,   // sleep_time
-        50    // snapshot_every_n
+        0,   // sleep_time
+        1    // snapshot_every_n
     ).await
 
 }
