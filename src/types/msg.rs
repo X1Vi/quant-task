@@ -1,7 +1,8 @@
 use std::os::raw::c_char;
 use std::collections::BTreeMap;
 use serde::{Serialize, Deserialize};
-
+use std::fs::File;
+use std::io::Write;
 // ============ CONSTANTS ============
 
 // Action codes
@@ -300,6 +301,13 @@ pub struct Market {
     pub books: BTreeMap<u32, BTreeMap<u16, Book>>,
 }
 
+#[derive(Serialize)]
+struct BookSnapshotJson {
+    instrument_id: u32,
+    publisher_id: u16,
+    levels: Vec<BidAskPair>,
+}
+
 impl Market {
     pub fn new() -> Self {
         Self { books: BTreeMap::new() }
@@ -359,5 +367,29 @@ impl Market {
             });
 
         (best_bid, best_ask)
+    }
+
+    pub fn write_snapshot_json(
+        &self,
+        instrument_id: u32,
+        publisher_id: u16,
+        levels: usize,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let books_for_instr = self.books.get(&instrument_id)
+            .ok_or("instrument not found")?;
+        let book = books_for_instr.get(&publisher_id)
+            .ok_or("publisher not found")?;
+
+        let snapshot = BookSnapshotJson {
+            instrument_id,
+            publisher_id,
+            levels: book.get_snapshot(levels),
+        };
+
+        let mut file = File::create(path)?;
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        file.write_all(json.as_bytes())?;
+        Ok(())
     }
 }

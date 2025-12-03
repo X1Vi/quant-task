@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use serde_json;
-use crate::types::msg::{RecordHeader, MboMsg as C_MboMsg};
+use crate::types::msg::{RecordHeader, MboMsg as C_MboMsg, Market};
 use tokio::task;
 use axum::{extract::State, routing::get, Json, Router};
 use tower_http::cors::CorsLayer;
@@ -92,7 +92,6 @@ async fn get_messages(State(cache): State<MessageCache>) -> Json<Vec<C_MboMsg>> 
     messages.sort_by_key(|m| m.sequence);
     Json(messages)
 }
-
 async fn read_and_broadcast_dbn(
     file_path: String,
     tx: broadcast::Sender<BroadcastMsg>,
@@ -104,7 +103,12 @@ async fn read_and_broadcast_dbn(
         let decoder = Decoder::from_file(file_path)?;
         let mut stream = decoder.decode_stream::<MboMsg>();
         let mut index = 0usize;
-        
+
+        // --- new: create market and trackers ---
+        let mut market = Market::new();
+        let mut last_inst: Option<u32> = None;
+        let mut last_pub: Option<u16> = None;
+
         while let Some(mbo_msg) = stream.next()? {
             let custom_msg = C_MboMsg {
                 hd: RecordHeader {
@@ -124,36 +128,45 @@ async fn read_and_broadcast_dbn(
                 ts_in_delta: mbo_msg.ts_in_delta,
                 sequence: mbo_msg.sequence,
             };
-            
+
+            // --- new: update order book + remember ids ---
+            market.apply(&custom_msg);
+            last_inst = Some(custom_msg.instrument_id());
+            last_pub  = Some(custom_msg.publisher_id());
+
             {
                 let mut cache_guard = cache.lock().unwrap();
                 cache_guard.insert(index % 20, custom_msg.clone());
             }
-            
+
             index += 1;
-            
+
             let serialized = serde_json::to_vec(&custom_msg)?;
             let mut message = serialized;
             message.push(b'\n');
-            
+
             let _ = tx.send(message);
-            
-            // Increment counter for rate tracking
+
             counter.fetch_add(1, Ordering::Relaxed);
-            
-            // Remove println to avoid bottleneck
             std::thread::sleep(std::time::Duration::from_micros(sleep_time));
         }
-        
+
+        if let (Some(inst), Some(pub_id)) = (last_inst, last_pub) {
+            if let Err(e) = market.write_snapshot_json(inst, pub_id, 50, "snapshot.json") {
+                eprintln!("Failed to write snapshot.json: {e}");
+            }
+        }
+
         Ok(())
     }).await;
-    
+
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(Box::new(e)),
     }
 }
+
 
 async fn handle_client(
     mut socket: TcpStream,
