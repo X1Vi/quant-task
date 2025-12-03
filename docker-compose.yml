@@ -1,0 +1,26 @@
+services:
+  rust-server:
+    build: .
+    container_name: hft-server
+    ports:
+      - "8080:8080"
+      - "3001:3001"
+    restart: unless-stopped
+
+  python-client:
+    build: ./py-server
+    container_name: hft-python
+    depends_on:
+      - rust-server
+    environment:
+      - SERVER_HOST=rust-server
+    restart: unless-stopped
+
+  react-client:
+    build: ./react-client-for-api/my-react-app
+    container_name: hft-react
+    ports:
+      - "5173:5173"
+    depends_on:
+      - rust-server
+    restart: unless-stopped

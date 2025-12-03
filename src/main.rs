@@ -1,11 +1,14 @@
-pub mod types;
-pub mod dbn;
-
-use crate::dbn::dbn_local::start_server;
-
+mod dbn;
+mod types;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    start_server("127.0.0.1:8080", "CLX5_mbo.dbn".to_string(), 400).await
-}
+    println!("Starting HFT server...");
 
+    // IMPORTANT: await the server future and return its Result
+    dbn::dbn_local::start_server(
+        "0.0.0.0:8080",
+        "CLX5_mbo.dbn".to_string(),
+        20,
+    ).await
+}

@@ -1,51 +1,30 @@
 import asyncio
-import json
 import time
+import os
 
+SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
+SERVER_PORT = 8080
 
 async def main():
-    # Retry connection until server is ready
-    max_retries = 10
-    retry_delay = 1
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"🔌 Attempting to connect (attempt {attempt + 1}/{max_retries})...")
-            reader, writer = await asyncio.open_connection('127.0.0.1', 8080)
-            print("✅ Connected to server")
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"⏳ Server not ready, retrying in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
-            else:
-                print(f"❌ Connection failed after {max_retries} attempts: {e}")
-                return
-    
-    count = 0
-    total = 0
-    last_time = time.time()
-    
+    print(f"Connecting to {SERVER_HOST}:{SERVER_PORT}...")
     while True:
-        line = await reader.readline()
-        if not line:
-            print("❌ Connection closed by server")
-            break
-        
-        count += 1
-        total += 1
-        
-        # Log every 100 messages
-        if total % 100 == 0:
-            print(f"📦 Received {total} total messages")
-        
-        # Log rate every second
-        now = time.time()
-        if now - last_time >= 1.0:
-            print(f"📊 Rate: {count} msg/s")
+        try:
+            reader, writer = await asyncio.open_connection(SERVER_HOST, SERVER_PORT)
+            print("Connected to TCP stream")
             count = 0
-            last_time = now
-
+            start = time.time()
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                count += 1
+                if count % 10000 == 0:
+                    elapsed = time.time() - start
+                    rate = count / elapsed if elapsed > 0 else 0
+                    print(f"Received {count} msgs | {rate:.0f} msg/s")
+        except Exception as e:
+            print(f"Connection error: {e}, retrying in 2s...")
+            await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(main())
